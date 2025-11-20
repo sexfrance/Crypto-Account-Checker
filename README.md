@@ -1,7 +1,7 @@
 <div align="center">
   <h2 align="center">Crypto.com Account Checker</h2>
   <p align="center">
-    An automated tool for checking Crypto.com accounts with proxy handling and multi-threading capabilities.
+    A PATCHED automated tool for checking Crypto.com accounts with proxy handling and multi-threading capabilities.
     <br />
     <br />
     <a href="https://discord.cyberious.xyz">💬 Discord</a>
@@ -37,6 +37,7 @@
 - Detailed logging system
 - Account data saving (email:phone format)
 - Full account capture with region and country details
+- Captcha solving support (NextCaptcha, Capsolver)
 
 ---
 
@@ -46,14 +47,15 @@
    Edit `input/config.toml`:
 
    ```toml
+   [captcha]
+   service = "nextcaptcha"  # or "capsolver"
+   api_key = "your_api_key"
+
    [dev]
    Debug = false
    Proxyless = false
    Threads = 1
-
-   [data]
-   password = "optional_custom_password"
-   email_verified = true
+   MaxRetries = 3
    ```
 
 2. **Proxy Setup** (Optional):
@@ -91,6 +93,9 @@
 ### 📜 ChangeLog
 
 ```diff
+v0.0.2 ⋮ 11/20/2025
++ Added captcha solving support (NextCaptcha, Capsolver)
+
 v0.0.1 ⋮ 10/21/2025
 ! Initial release with proxy support and multi-threading
 ```

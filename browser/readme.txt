@@ -1,0 +1,1 @@
+Ignore this script, it is unfinished but can be used as a base for a browser based checker. This script is also mostly made by ai
